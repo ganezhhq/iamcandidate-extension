@@ -119,27 +119,78 @@ body {
 
 /* ---------- your details ---------- */
 
-.details-summary {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 6px 12px;
-  margin: 0;
+.card-actions {
+  display: flex;
+  gap: 12px;
 }
 
-.details-summary dt {
+.details-groups {
+  display: grid;
+  gap: 14px;
+}
+
+.details-group-title {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
   color: var(--muted);
 }
 
-.details-summary dd {
+/* Label · value · copy button. Long values wrap, so nothing is cut off. */
+.details-list {
+  display: grid;
+  grid-template-columns: minmax(84px, auto) 1fr auto;
+  gap: 6px 10px;
+  align-items: start;
+  margin: 0;
+}
+
+.details-list dt {
+  color: var(--muted);
+}
+
+.details-list dd {
   margin: 0;
   min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-line;
+}
+
+.details-list dd.empty {
+  color: var(--missing);
+}
+
+/* Summary, cover letter, job descriptions: show a few lines; the copy button copies all of it. */
+.details-list dd.long {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
   overflow: hidden;
-  text-overflow: ellipsis;
+}
+
+.copy-btn {
+  padding: 0 2px;
+  border: 0;
+  background: none;
+  color: var(--brand);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
   white-space: nowrap;
 }
 
-.details-summary dd.empty {
-  color: var(--missing);
+.copy-btn:hover {
+  text-decoration: underline;
+}
+
+.copy-btn.copied {
+  color: var(--ok);
+}
+
+.copy-spacer {
+  width: 1px;
 }
 
 /* ---------- cards ---------- */

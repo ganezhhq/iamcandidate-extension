@@ -175,8 +175,10 @@ async function readTab() {
   state.readable = false
   if (tab?.id && isHttpUrl(tab.url)) {
     try {
-      const [result] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: extractPage })
-      page = result?.result
+      // Every frame: career sites often embed the posting (Greenhouse, Lever,
+      // Ashby…) in an iframe, and the description lives there, not on the page.
+      const results = await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, func: extractPage })
+      page = bestPage(results)
       state.readable = true
     } catch {
       // No access to this site yet: granted on the first Autofill click.
@@ -184,25 +186,51 @@ async function readTab() {
   }
 
   const here = page?.job ?? {}
-  if (page?.kind === "job" && here.description) await rememberJob(tab.id, { ...here, site: page.site })
-  const earlier = here.description ? undefined : await recallJob(tab?.id)
+  // A heading or a one-line snippet isn't a posting: keep using the full one read earlier.
+  const fullPosting = text(here.description).length >= MIN_DESCRIPTION
+  if (page?.kind === "job" && fullPosting) await rememberJob(tab.id, { ...here, site: page.site })
+  const earlier = fullPosting ? undefined : await recallJob(tab?.id)
   const role = cleanRole(here.role)
   // The posting's own link beats the application form's, which is often a one-off.
   const pick = (key) => here[key] || earlier?.[key] || ""
+  const description = [here.description, earlier?.description].map(text).sort((a, b) => b.length - a.length)[0] ?? ""
   state.job = {
     role: role || cleanRole(earlier?.role),
     company: pick("company"),
     location: pick("location"),
     workMode: pick("workMode"),
     jobId: pick("jobId"),
-    jobUrl: (here.description ? here.jobUrl : earlier?.jobUrl) || here.jobUrl || (isHttpUrl(tab?.url) ? tab.url : ""),
-    description: pick("description"),
+    jobUrl: (fullPosting ? here.jobUrl : earlier?.jobUrl) || here.jobUrl || (isHttpUrl(tab?.url) ? tab.url : ""),
+    description,
     site: page?.site || earlier?.site || hostOf(tab?.url),
   }
   if (changed) closeAppliedForm()
   renderJob()
   renderMatch()
   await showStoredReport()
+}
+
+/** Shorter than this, a "description" is a heading or snippet, too little to score a resume against. */
+const MIN_DESCRIPTION = 200
+
+/**
+ * One reading of the page from every frame's: the top frame's, with the job
+ * from whichever frame holds the fullest posting (an embedded job board).
+ * A LinkedIn profile in the top frame wins outright.
+ */
+function bestPage(results) {
+  const pages = (results ?? []).filter((r) => r?.result)
+  const top = pages.find((r) => r.frameId === 0)?.result ?? pages[0]?.result
+  if (!top || top.kind === "profile") return top
+  const richest = pages
+    .map((r) => r.result)
+    .filter((p) => p.kind === "job" && p.job)
+    .sort((a, b) => text(b.job.description).length - text(a.job.description).length)[0]
+  if (!richest || richest === top) return top
+  // Fields the embedded posting lacks come from the page around it.
+  const job = { ...top.job }
+  for (const [key, value] of Object.entries(richest.job)) if (text(value)) job[key] = value
+  return { ...top, kind: "job", job, site: richest.site || top.site }
 }
 
 /** The last fill in this tab (often the automatic one), unless one is running now. */
@@ -268,9 +296,12 @@ function renderMatch() {
   $("match-experience").hidden = !result?.experience
   $("match-empty").hidden = (!resume && !state.skills.length) || !!result
   if (!result) {
-    $("match-empty").textContent = state.job?.description
-      ? "This job doesn't name skills we can compare."
-      : "Open the job posting first to compare it with your resume."
+    const fillable = state.tab?.id && isHttpUrl(state.tab.url)
+    $("match-empty").textContent = !state.readable && fillable
+      ? "IamCandidate can't read this page yet. Click Autofill once to allow it, and the score appears."
+      : text(state.job?.description).length >= 40
+        ? "This job doesn't name skills we can compare."
+        : "No job description found here. Open the job posting (or scroll it into view) and press refresh."
     return
   }
 
@@ -611,34 +642,175 @@ async function renderAutoFill() {
 /* Your details                                                        */
 /* ------------------------------------------------------------------ */
 
-/** Shown in the summary; the rest are counted. */
-const SUMMARY = [
-  ["Name", (d) => d.fullName],
-  ["Email", (d) => d.email],
-  ["Phone", (d) => d.phone],
-  ["City", (d) => d.city],
-  ["LinkedIn", (d) => d.linkedin],
-  ["Current role", (d) => [d.currentTitle, d.currentCompany].filter(Boolean).join(" at ")],
-  ["Notice period", (d) => d.noticePeriod],
-  ["Expected salary", (d) => d.expectedSalary],
+const text = (value) => String(value ?? "").trim()
+const yesNo = (value) => ({ yes: "Yes", no: "No" })[text(value).toLowerCase()] ?? text(value)
+
+/** One line for a postal address: "12 Main St, Chennai, Tamil Nadu 600001, India". */
+const fullAddress = (d) =>
+  [text(d.addressLine), text(d.city), [text(d.state), text(d.postalCode)].filter(Boolean).join(" "), text(d.country)]
+    .filter(Boolean)
+    .join(", ")
+
+/** "2021-03" → "Mar 2021". */
+const monthYear = (yearMonth) => {
+  const [, y, m] = text(yearMonth).match(/^(\d{4})-(\d{2})$/) ?? []
+  return y ? `${new Date(Number(y), Number(m) - 1).toLocaleString(undefined, { month: "short" })} ${y}` : text(yearMonth)
+}
+
+/**
+ * Everything saved on the Autofill page, grouped as there. Each row is
+ * `[label, read]`; `long` rows (summary, cover letter) show a few lines.
+ */
+const DETAIL_GROUPS = [
+  {
+    title: "Personal",
+    rows: [
+      ["First name", (d) => d.firstName],
+      ["Last name", (d) => d.lastName],
+      ["Full name", (d) => d.fullName],
+      ["Preferred name", (d) => d.preferredName],
+      ["Email", (d) => d.email],
+      ["Phone", (d) => d.phone],
+      ["Pronouns", (d) => d.pronouns],
+    ],
+  },
+  {
+    title: "Address",
+    rows: [
+      ["Address", (d) => d.addressLine],
+      ["City", (d) => d.city],
+      ["State", (d) => d.state],
+      ["Postal code", (d) => d.postalCode],
+      ["Country", (d) => d.country],
+      ["Full address", fullAddress],
+    ],
+  },
+  {
+    title: "Links",
+    rows: [
+      ["LinkedIn", (d) => d.linkedin],
+      ["GitHub", (d) => d.github],
+      ["Portfolio", (d) => d.portfolio],
+    ],
+  },
+  {
+    title: "Work",
+    rows: [
+      ["Current title", (d) => d.currentTitle],
+      ["Current company", (d) => d.currentCompany],
+      ["Years of experience", (d) => text(d.experienceYears) || (totalYears(d) ? `${totalYears(d)} (from your work history)` : "")],
+      ["Notice period", (d) => d.noticePeriod],
+      ["Current salary", (d) => d.currentSalary],
+      ["Expected salary", (d) => d.expectedSalary],
+    ],
+  },
+  {
+    title: "Work authorization",
+    rows: [
+      ["Authorized to work", (d) => yesNo(d.workAuthorization)],
+      ["Needs sponsorship", (d) => yesNo(d.needsSponsorship)],
+      ["Willing to relocate", (d) => yesNo(d.willingToRelocate)],
+    ],
+  },
+  {
+    title: "Education",
+    rows: [
+      ["School", (d) => d.school],
+      ["Degree", (d) => d.degree],
+      ["Field of study", (d) => d.fieldOfStudy],
+      ["Graduation year", (d) => d.graduationYear],
+    ],
+  },
+  {
+    title: "Voluntary questions",
+    rows: [
+      ["Gender", (d) => d.gender],
+      ["Ethnicity", (d) => d.ethnicity],
+      ["Disability", (d) => d.disability],
+      ["Veteran", (d) => d.veteran],
+    ],
+  },
+  {
+    title: "About you",
+    rows: [
+      ["Summary", (d) => d.summary, { long: true }],
+      ["Cover letter", (d) => d.coverLetter, { long: true }],
+    ],
+  },
 ]
-const NOT_DETAILS = new Set(["fullName", "location", "answers", "experience"])
+
+/** Your work history as label/value rows: "Engineer at Acme" → "Mar 2021 – Present · Chennai\n…". */
+function workHistoryRows(details) {
+  const jobs = Array.isArray(details.experience) ? details.experience : []
+  return jobs.map((job) => {
+    const dates = [monthYear(job.startDate), job.current ? "Present" : monthYear(job.endDate)].filter(Boolean).join(" – ")
+    const head = [text(job.title), text(job.company)].filter(Boolean).join(" at ") || "Job"
+    const meta = [dates, text(job.location)].filter(Boolean).join(" · ")
+    return [head, () => [meta, text(job.description)].filter(Boolean).join("\n"), { long: true }]
+  })
+}
+
+/** Copies on click and says so for a moment. */
+function copyButton(value, label = "Copy") {
+  const button = el("button", { type: "button", className: "copy-btn", textContent: label, title: "Copy to clipboard" })
+  button.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(value)
+      button.textContent = "Copied"
+      button.classList.add("copied")
+    } catch {
+      button.textContent = "Couldn't copy"
+    }
+    setTimeout(() => {
+      button.textContent = label
+      button.classList.remove("copied")
+    }, 1400)
+  })
+  return button
+}
+
+/** Every detail as plain text, for "Copy all". */
+let detailsAsText = ""
 
 function renderDetails() {
   const details = state.details ?? {}
-  $("details-summary").replaceChildren(
-    ...SUMMARY.flatMap(([label, read]) => {
-      const value = String(read(details) ?? "").trim()
-      return [
-        el("dt", { textContent: label }),
-        el("dd", { textContent: value || "Not set", className: value ? "" : "empty", title: value }),
-      ]
-    }),
+  const groups = [...DETAIL_GROUPS, { title: "Work history", rows: workHistoryRows(details) }]
+  const lines = []
+  let filled = 0
+  let total = 0
+
+  $("details-groups").replaceChildren(
+    ...groups
+      .filter((group) => group.rows.length)
+      .map((group) => {
+        lines.push(`${group.title}`)
+        const rows = group.rows.flatMap(([label, read, { long = false } = {}]) => {
+          const value = text(read(details))
+          // "Full address" and "Full name" repeat other rows, so they don't count.
+          if (!/^Full /.test(label) && group.title !== "Work history") {
+            total += 1
+            if (value) filled += 1
+          }
+          if (value) lines.push(`${label}: ${value}`)
+          return [
+            el("dt", { textContent: label }),
+            el("dd", { textContent: value || "Not set", className: [value ? "" : "empty", long && value ? "long" : ""].join(" ").trim(), title: value }),
+            value ? copyButton(value) : el("span", { className: "copy-spacer" }),
+          ]
+        })
+        lines.push("")
+        return el(
+          "section",
+          {},
+          el("p", { className: "details-group-title", textContent: group.title }),
+          el("dl", { className: "details-list" }, ...rows),
+        )
+      }),
   )
-  const keys = Object.keys(details).filter((key) => !NOT_DETAILS.has(key))
-  const set = keys.filter((key) => String(details[key] ?? "").trim()).length
-  $("details-count").textContent = keys.length
-    ? `${set} of ${keys.length} details filled in. Questions without one are left for you on each form.`
+  detailsAsText = lines.join("\n").trim()
+  $("details-copy-all").hidden = !filled
+  $("details-count").textContent = total
+    ? `${filled} of ${total} details filled in. Questions without one are left for you on each form.`
     : ""
 
   const entries = Object.values(state.answers).sort((a, b) => (b.savedAt ?? 0) - (a.savedAt ?? 0))
@@ -655,6 +827,7 @@ function renderDetails() {
           el("p", { className: "strong", textContent: answer.label, title: answer.label }),
           el("p", { className: "muted", textContent: answer.value, title: answer.value }),
         ),
+        text(answer.value) ? copyButton(text(answer.value)) : undefined,
       ),
     ),
   )
@@ -742,6 +915,16 @@ function wireEvents() {
   })
 
   $("details-edit").addEventListener("click", openAutofillPage)
+  $("details-copy-all").addEventListener("click", async (event) => {
+    const button = event.currentTarget
+    try {
+      await navigator.clipboard.writeText(detailsAsText)
+      button.textContent = "Copied"
+    } catch {
+      button.textContent = "Couldn't copy"
+    }
+    setTimeout(() => (button.textContent = "Copy all"), 1400)
+  })
   // Coming back from IamCandidate: details edited, applications or skills added or removed.
   window.addEventListener("focus", () => {
     if (state.session && !state.running) {
