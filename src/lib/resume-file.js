@@ -2,6 +2,8 @@ import { api } from "./api.js"
 
 /** Larger files aren't worth passing into the page; you attach those yourself. */
 const MAX_RESUME_BYTES = 8 * 1024 * 1024
+/** File name (without extension) used when attaching a resume to an application. */
+const UPLOAD_NAME = "Ganeshguru_resume"
 /** The resume picked in the autofill panel. */
 export const RESUME_PREF_KEY = "iamcandidate:panel-resume"
 
@@ -30,8 +32,9 @@ export async function resumeFile(resume) {
     let binary = ""
     for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
     const type = response.headers.get("content-type")?.split(";")[0] || doc.mimeType || "application/pdf"
-    let name = doc.name || `${resume.title || "resume"}.pdf`
-    if (!/\.[a-z0-9]{2,4}$/i.test(name)) name += type.includes("pdf") ? ".pdf" : ""
+    // Applications get a fixed, version-free file name; only the extension is kept.
+    const ext = (doc.name || "").match(/\.[a-z0-9]{2,4}$/i)?.[0].toLowerCase() || (type.includes("pdf") ? ".pdf" : "")
+    const name = `${UPLOAD_NAME}${ext}`
     return { file: { name, type, base64: btoa(binary) } }
   } catch (error) {
     console.warn("IamCandidate: could not get the resume file", error)
